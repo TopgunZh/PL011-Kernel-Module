@@ -16,8 +16,8 @@
 #include <linux/amba/bus.h>
 #include <linux/amba/serial.h>
 
-#define WRITE_BUFFER_LENGTH 16
-#define READ_BUFFER_LENGTH 16
+#define WRITE_BUFFER_LENGTH 32
+#define READ_BUFFER_LENGTH 32
 #define SERIAL_RESET_COUNTER 0
 #define SERIAL_GET_COUNTER 1
 
@@ -53,7 +53,6 @@ static void write_char(struct feserial_device* dev, char value)
         cpu_relax();
     }
 
-    // Clear the TX/RX segment and write value to it
     reg_write(dev, value, UART01x_DR);
     dev->symbol_counter++;
     if (value == '\n')
@@ -232,7 +231,7 @@ static int feserial_probe(struct platform_device* pdev)
                   UART011_CR_TXE | UART01x_CR_UARTEN,
               UART011_CR);
 
-    // FIFO select TX/RX 1/8 (interrupt on every char)
+    // FIFO select TX/RX 1/8
 
     reg_write(local_dev, UART011_IFLS_RX1_8 | UART011_IFLS_TX1_8, UART011_IFLS);
 
@@ -257,7 +256,7 @@ static int feserial_probe(struct platform_device* pdev)
     local_dev->miscdev.fops = &serial_fops;
 
     platform_set_drvdata(pdev, local_dev);
-    pr_info("Called feserial_probe\n");
+
     return misc_register(&local_dev->miscdev);
 }
 
