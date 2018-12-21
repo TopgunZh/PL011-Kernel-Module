@@ -16,8 +16,8 @@
 #include <linux/amba/bus.h>
 #include <linux/amba/serial.h>
 
-#define WRITE_BUFFER_LENGTH 32
-#define READ_BUFFER_LENGTH 32
+#define WRITE_BUFFER_LENGTH 16
+#define READ_BUFFER_LENGTH 16
 #define SERIAL_RESET_COUNTER 0
 #define SERIAL_GET_COUNTER 1
 
@@ -34,6 +34,8 @@ struct feserial_device
     u32 serial_buf_tail;
     int irq;
     wait_queue_head_t feserial_wait;
+    spinlock_t buffer_lock;
+    spinlock_t device_lock;
 };
 
 static unsigned int reg_read(struct feserial_device* dev, int offset)
@@ -48,12 +50,16 @@ static void reg_write(struct feserial_device* dev, int value, int offset)
 
 static void write_char(struct feserial_device* dev, char value)
 {
+
+    spin_lock(&dev->device_lock);
     while ((reg_read(dev, UART01x_FR) & UART01x_FR_TXFF) != 0)
     {
         cpu_relax();
     }
-
+    // Clear the TX/RX segment and write value to it
     reg_write(dev, value, UART01x_DR);
+    spin_unlock(&dev->device_lock);
+
     dev->symbol_counter++;
     if (value == '\n')
     {
@@ -67,22 +73,14 @@ ssize_t serial_read(struct file* file, char __user* buffer, size_t buffer_size,
     struct feserial_device* dev =
         container_of(file->private_data, struct feserial_device, miscdev);
 
-    int size = 0;
-
     wait_event_interruptible(dev->feserial_wait,
                              dev->serial_buf_tail != dev->serial_buf_head);
 
-    while (dev->serial_buf_tail != dev->serial_buf_head)
-    {
-        if (size == buffer_size)
-        {
-            break;
-        }
-        put_user(dev->read_buffer[dev->serial_buf_tail++], buffer + size++);
-
-        dev->serial_buf_tail %= READ_BUFFER_LENGTH;
-    }
-    return size;
+    spin_lock(&dev->buffer_lock);
+    put_user(dev->read_buffer[dev->serial_buf_tail++], buffer);
+    dev->serial_buf_tail %= READ_BUFFER_LENGTH;
+    spin_unlock(&dev->buffer_lock);
+    return 1;
 }
 
 ssize_t serial_write(struct file* file, const char __user* user_buffer,
@@ -107,7 +105,7 @@ ssize_t serial_write(struct file* file, const char __user* user_buffer,
 
     if (error_bytes != 0)
     {
-        printk("Couldn't copy %u bytes", error_bytes);
+        pr_alert("Couldn't copy %u bytes", error_bytes);
         return -EINVAL;
     }
 
@@ -145,10 +143,22 @@ struct file_operations serial_fops = {
 static irqreturn_t feserial_irq(int irq, void* dev_id)
 {
     struct feserial_device* local_dev = (struct feserial_device*)dev_id;
-    u8 symbol = reg_read(local_dev, UART01x_DR);
+    u8 symbol;
 
+    spin_lock(&local_dev->device_lock);
+    symbol = reg_read(local_dev, UART01x_DR);
+    spin_unlock(&local_dev->device_lock);
+
+    spin_lock(&local_dev->buffer_lock);
+    if (symbol == '\r')
+    {
+        local_dev->read_buffer[local_dev->serial_buf_head++] = '\n';
+        local_dev->serial_buf_head %= READ_BUFFER_LENGTH;
+    }
     local_dev->read_buffer[local_dev->serial_buf_head++] = symbol;
     local_dev->serial_buf_head %= READ_BUFFER_LENGTH;
+
+    spin_unlock(&local_dev->buffer_lock);
 
     wake_up(&local_dev->feserial_wait);
     return IRQ_HANDLED;
@@ -172,6 +182,10 @@ static int feserial_probe(struct platform_device* pdev)
     local_dev->symbol_counter = 0;
     local_dev->serial_buf_head = 0;
     local_dev->serial_buf_tail = 0;
+
+    spin_lock_init(&local_dev->buffer_lock);
+    spin_lock_init(&local_dev->device_lock);
+
     init_waitqueue_head(&local_dev->feserial_wait);
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 
@@ -231,7 +245,7 @@ static int feserial_probe(struct platform_device* pdev)
                   UART011_CR_TXE | UART01x_CR_UARTEN,
               UART011_CR);
 
-    // FIFO select TX/RX 1/8
+    // FIFO select TX/RX 1/8 (interrupt on every char)
 
     reg_write(local_dev, UART011_IFLS_RX1_8 | UART011_IFLS_TX1_8, UART011_IFLS);
 
@@ -256,7 +270,7 @@ static int feserial_probe(struct platform_device* pdev)
     local_dev->miscdev.fops = &serial_fops;
 
     platform_set_drvdata(pdev, local_dev);
-
+    pr_info("Called feserial_probe\n");
     return misc_register(&local_dev->miscdev);
 }
 
